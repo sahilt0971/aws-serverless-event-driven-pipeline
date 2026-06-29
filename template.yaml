@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Advanced Serverless Event-Driven Architecture with DLQ and API Gateway Integration
+
+Resources:
+  # 1. Dead Letter Queue (The safety net for broken messages)
+  IngestionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: IngestionPipeline-DLQ
+
+  # 2. Main SQS Buffer Queue (Connected to the DLQ)
+  IngestionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: IngestionPipeline-MainQueue
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestionDLQ.Arn
+        maxReceiveCount: 3
+
+  # 3. Secure API Gateway
+  AdvancedIngestionAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      DefinitionBody:
+        openapi: "3.0.1"
+        info:
+          title: "IngestionAPI"
+          version: "1.0"
+        paths:
+          /events:
+            post:
+              x-amazon-apigateway-integration:
+                credentials: !GetAtt APIGatewaySQSRole.Arn
+                httpMethod: "POST"
+                type: "aws"
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${IngestionQueue.QueueName}"
+                requestParameters:
+                  "integration.request.header.Content-Type": "'application/x-www-form-urlencoded'"
+                requestTemplates:
+                  application/json: "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseTemplates:
+                      application/json: '{"status": "Event queued successfully"}'
+              responses:
+                "200":
+                  description: "Success"
+
+  # 4. IAM Role giving API Gateway permission to write straight to SQS
+  APIGatewaySQSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: APIGatewaySendToSQS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt IngestionQueue.Arn
+
+  # 5. DynamoDB Table (Hot Store)
+  AnalyticsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: UserActivityLog
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  # 6. Core Processor Lambda Function
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: processor.lambda_handler
+      Runtime: python3.11
+      CodeUri: ./src
+      Timeout: 15
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AnalyticsTable
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestionQueue.Arn
+            BatchSize: 5
+
+  # 7. S3 Data Lake (Cold Store)
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "data-lake-archiver-${AWS::AccountId}"
+
+  # 8. Archiver Lambda Function (DynamoDB Stream to S3)
+  ArchiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: archiver.lambda_handler
+      Runtime: python3.11
+      CodeUri: ./src
+      Timeout: 15
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataLakeBucket
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref DataLakeBucket
+      Events:
+        DynamoDBStreamTrigger:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt AnalyticsTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+
+Outputs:
+  TargetAPIEndpoint:
+    Description: "The public HTTP URL endpoint for pushing analytics data live"
+    Value: !Sub "https://${AdvancedIngestionAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/events"
